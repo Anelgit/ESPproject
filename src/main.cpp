@@ -1,874 +1,729 @@
-
 /*******************************************************
- * Project: ESP32 Voice-Controlled Lighting & Cooling
- * Author : Anel Hodza
- * Date   : September 2025
+ * Project: ESP32 Voice-Controlled Lighting & Cooling                     
+ * Author : Anel Hodza                                                   
+ * Date   : September 2025                                               
  *
- * Description:
- *   This project implements an ESP32-based IoT system 
- *   for controlling lights and cooling through MQTT.
- *   The ESP32 connects to Wi-Fi and communicates with 
- *   a Mosquitto broker running locally on the LAN.
- *   Node-RED is used as the visualization and control 
- *   dashboard, with switches and gauges for monitoring 
- *   system state.
+ * Description:                                                          
+ *   This project implements an ESP32-based IoT system                   
+ *   for controlling lights and cooling through MQTT.                    
+ *   The ESP32 connects to Wi-Fi and communicates with                   
+ *   a Mosquitto broker running locally on the LAN.                      
+ *   Node-RED is used as the visualization and control                   
+ *   dashboard, with switches and gauges for monitoring                  
+ *   system state.                                                       
  *
- * Features:
- *   - MQTT subscribe: listens for ON/OFF commands 
- *     on topic: "ahodza/home/lights/set"
- *   - MQTT publish : reports LED state 
- *     on topic: "ahodza/home/lights/status"
- *   - Retained messages ensure UI and device stay synced
- *   - Designed for easy extension (cooling fan, sensors)
+ * Features:                                                             
+ *   - MQTT subscribe: listens for ON/OFF commands                       
+ *     on topic: "ahodza/home/lights/set"                                
+ *   - MQTT publish : reports LED state                                  
+ *     on topic: "ahodza/home/lights/status"                             
+ *   - Retained messages ensure UI and device stay synced                
+ *   - Designed for easy extension (cooling fan, sensors)                
  *
- * Hardware:
- *   - ESP32 DevKit
- *   - Onboard LED (GPIO 2) or external LED/fan on GPIO 14
- *   - Optional: DHT sensor for temperature & humidity
+ * Hardware:                                                             
+ *   - ESP32 DevKit                                                      
+ *   - Onboard LED (GPIO 2) or external LED/fan on GPIO 14               
+ *   - BME sensor for temperature & humidity                   
  *
- * Software Stack:
- *   - Arduino Core for ESP32
- *   - PubSubClient (MQTT)
- *   - Node-RED Dashboard
- *   - Mosquitto Broker (local)
- * TODO:
- *   [ ] Replace onboard LED with 12V LED strip + MOSFET driver
- *   [ ] Add DC fan control via transistor/MOSFET
- *   [ ] Integrate DHT22 for temperature & humidity
- *   [ ] Expand Node-RED dashboard with real-time charts
- *   [ ] Add voice command interface (ESP-SR / Google Assistant)
- *   [ ] Improve error handling & auto-reconnect logic
+ * Software Stack:                                                       
+ *   - Arduino Core for ESP32                                            
+ *   - PubSubClient (MQTT)                                               
+ *   - Node-RED Dashboard                                                
+ *   - Mosquitto Broker (local)                                          
  *
+ * TODO (updated):                                                       
+ *   [ ] Persist settings in NVS (Preferences): autoFanEnabled & FAN_TARGET_C      
+ *   [ ] Add MQTT config topics:                                           
+ *       - ahodza/home/fan/target_c/set (Number)                           
+ *       - ahodza/home/fan/mode/set ("auto"/"sleep")                       
+ *   [ ] Node-RED: add fan tile (mode/target/status) + charts for T/RH/P    
+ *   [ ] Hardware: drive fan via MOSFET or relay + flyback, add series resistor on LEDs 
+ *   [ ] Security: optional MQTT auth/TLS; move creds to secrets header               
+ *   [ ] KWS: capture more templates (esp. wake), optional distinct "off" phrase      
+ *   [ ] KWS: disable debug in prod, add lightweight telemetry event (optional)       
+ *   [ ] Networking: exponential backoff and error LED pattern on Wi-Fi/MQTT failure  
+ *   [ ] Power: consider light sleep when idle, tune VAD thresholds to lower CPU      
  *
  *******************************************************/
-#include <Arduino.h>
-#include <WiFi.h>
-#include <PubSubClient.h>
-#include <SPI.h>
-#include <Adafruit_BME280.h>
-#include "wakeword_templates.h"
+#include <Arduino.h>                     
+#include <WiFi.h>                        
+#include <PubSubClient.h>                
+#include <SPI.h>                         
+#include <Adafruit_BME280.h>             
+#include "wakeword_templates.h"          
 
-#include <math.h>
-#include <driver/i2s.h>
-#include <ArduinoFFT.h>
+#include <math.h>                        
+#include <driver/i2s.h>                  
+#include <ArduinoFFT.h>                  
 
 // ---------- Wi-Fi ----------
 
-// Stores Wi-Fi network name (SSID) as a read-only C string in flash.
-const char* WIFI_SSID = "FBI Surveillance van 4";
-// Stores Wi-Fi password as a read-only C string in flash.
-const char* WIFI_PASS = "anelshjem";
+const char* WIFI_SSID = "FBI Surveillance van 4";   // SSID string stored in flash 
+const char* WIFI_PASS = "anelshjem";                // Wi-Fi password string 
 
 // ---------- MQTT ----------
 
-// IP/hostname of the MQTT broker the ESP connects to.
- const char* MQTT_HOST = "192.168.1.2";
-//const char* MQTT_HOST = "192.168.1.10";   // or your PC’s actual IP/hostname
+const char* MQTT_HOST = "192.168.1.2";             // MQTT broker host/IP used by WiFiClient to connect
+//const char* MQTT_HOST = "192.168.1.10";          // Alternate broker host/IP (disabled here)
 
-// TCP port for the MQTT broker.
-const uint16_t MQTT_PORT = 1883;
+const uint16_t MQTT_PORT = 1883;                   // Broker TCP port (default Mosquitto is 1883, no TLS)
 
 // Lights topics 
 
-// Topic to which we subscribe to receive light control commands (setpoint).
-static const char* TOPIC_LIGHT_SET    = "ahodza/home/lights/set";
-// Topic to which we publish the current light state so other clients can reflect it.
-static const char* TOPIC_LIGHT_STATUS = "ahodza/home/lights/status";
+static const char* TOPIC_LIGHT_SET    = "ahodza/home/lights/set";    // Subscribed command topic for light
+static const char* TOPIC_LIGHT_STATUS = "ahodza/home/lights/status"; // Published status topic (retained)
 
 // Env topics (new/used)
 
-// LWT/online status topic telling others if this device is online/offline.
-static const char* TOPIC_ENV_STATUS = "ahodza/home/env/status";       // online/offline (LWT)
-// JSON “snapshot” of environment values; retained so dashboards load with last known.
-static const char* TOPIC_ENV_STATE  = "ahodza/home/env/state";        // JSON (retained)
-// Simple scalar temp topic; retained for easy binding to dashboard widgets.
-static const char* TOPIC_ENV_TEMP   = "ahodza/home/env/temp_c";       // retained
-// Simple scalar humidity topic; retained.
-static const char* TOPIC_ENV_HUM    = "ahodza/home/env/humidity";     // retained
-// Simple scalar pressure topic; retained.
-static const char* TOPIC_ENV_PRES   = "ahodza/home/env/pressure_hpa"; // retained
+static const char* TOPIC_ENV_STATUS = "ahodza/home/env/status";       // LWT/online status retained topic
+static const char* TOPIC_ENV_STATE  = "ahodza/home/env/state";        // JSON snapshot retained topic
+static const char* TOPIC_ENV_TEMP   = "ahodza/home/env/temp_c";       // Retained numeric temperature
+static const char* TOPIC_ENV_HUM    = "ahodza/home/env/humidity";     // Retained numeric humidity
+static const char* TOPIC_ENV_PRES   = "ahodza/home/env/pressure_hpa"; // Retained numeric pressure
 
 // ---------- Hardware ----------
 
-// Logical pin number for the on-board LED on ESP32 DevKit (GPIO2).
-constexpr int LED_PIN = 2;   // Built-in LED (now used to indicate auto fan ON)
+constexpr int LED_PIN = 2;              // Built-in LED (GPIO2) used as "auto fan enabled" indicator
+constexpr int LED_LIGHT_PIN = 4;        // External LED output for "lights on/off" indication (GPIO4)
+constexpr int FAN_PIN = 27;             // Fan driver output pin (to MOSFET/relay input), HIGH = fan ON
 
-// External LED to represent “lights on/off” output (separate from built-in).
-constexpr int LED_LIGHT_PIN = 4; // External LED for lights (GPIO4 is usually safe)
+// BME280 SPI pins (software SPI wiring for Adafruit_BME280)
+#define BME_SCK   18                    // SPI clock pin wired to BME SCK
+#define BME_MISO  19                    // SPI MISO pin wired to BME SDO (sensor→ESP32)
+#define BME_MOSI  23                    // SPI MOSI pin wired to BME SDA (ESP32→sensor data)
+#define BME_CS     5                    // Chip Select pin wired to BME CS (active low)
 
-// Fan control output pin (drive a transistor/relay). Active-HIGH = fan ON.
-constexpr int FAN_PIN = 27;
-
-// BME280 SPI pins
-// BME SCK  -> GPIO18
-// BME SDO  -> GPIO19 (MISO)
-// BME SDA  -> GPIO23 (MOSI)
-// BME CS   -> GPIO5
-
-// Pin constant for SPI SCK clock line to the BME280.
-#define BME_SCK   18
-// Pin constant for SPI MISO (sensor → ESP32 data).
-#define BME_MISO  19
-// Pin constant for SPI MOSI (ESP32 → sensor data).
-#define BME_MOSI  23
-// Pin constant for the BME280’s chip-select line (active low).
-#define BME_CS     5
-
-// Instantiates a BME280 driver object configured to use “software SPI” on the pins above.
-Adafruit_BME280 bme(BME_CS, BME_MOSI, BME_MISO, BME_SCK);
+Adafruit_BME280 bme(BME_CS, BME_MOSI, BME_MISO, BME_SCK); // Construct sensor driver in software SPI mode
 
 // ---------- Globals ----------
 
-// Creates a TCP socket-like object used by PubSubClient to move bytes over Wi-Fi.
-WiFiClient esp;
-// Creates the MQTT client, binding it to the WiFiClient so it can connect to the broker.
-PubSubClient mqtt(esp);
+WiFiClient esp;                         // TCP client used by PubSubClient to transport MQTT bytes
+PubSubClient mqtt(esp);                 // MQTT client bound to the WiFiClient socket
 
 // Lights state
-
-// Tracks whether the light is currently on; mirrors hardware and status topic.
-bool lightOn = false;
+bool lightOn = false;                   // Shadow state for external LED (true → LED on)
 
 // Env publish cadence / hysteresis
+const uint32_t PUBLISH_MS     = 5000;   // Minimum ms between publishes to avoid UI spam
+const float    MIN_DELTA_TEMP = 0.05f;  // Epsilon change to trigger temp publish (°C)
+const float    MIN_DELTA_HUM  = 0.50f;  // Epsilon change to trigger humidity publish (%RH)
+const float    MIN_DELTA_PRES = 0.50f;  // Epsilon change to trigger pressure publish (hPa)
 
-// Minimum time between environment publishes; prevents spamming broker/UI.
-const uint32_t PUBLISH_MS     = 5000;  // 5 s
-// Minimal temperature change needed to trigger a publish (noise filtering).
-const float    MIN_DELTA_TEMP = 0.05f; // °C
-// Minimal humidity change needed to trigger a publish.
-const float    MIN_DELTA_HUM  = 0.50f; // %RH
-// Minimal pressure change needed to trigger a publish.
-const float    MIN_DELTA_PRES = 0.50f; // hPa
-
-// Stores the last time (millis) we published env data to rate-limit updates.
-unsigned long t_last_pub = 0;
-// Caches last published temperature/humidity/pressure; starts as NaN so the first read publishes.
-float last_t = NAN, last_h = NAN, last_p = NAN;
+unsigned long t_last_pub = 0;           // Last publish timestamp (millis) for rate limiting
+float last_t = NAN, last_h = NAN, last_p = NAN; // Last published readings (NaN forces first publish)
 
 // ---------- Fan auto-control (thermostat) ----------
 
-// Desired room temperature (°C) for auto fan.
-const float FAN_TARGET_C = 20.0f;
-// Total hysteresis band (°C). Fan turns ON above target+H/2, OFF below target-H/2.
-const float FAN_HYST_C   = 1.0f;
+const float FAN_TARGET_C = 20.0f;       // Desired room temperature setpoint (°C)
+const float FAN_HYST_C   = 1.0f;        // Total hysteresis band (°C) to prevent fan chatter
 
-bool  autoFanEnabled = false;  // whether we “listen to the temp sensor”
-bool  fanOn = false;           // actual fan output state
-float current_temp_c = NAN;    // last measured temperature
+bool  autoFanEnabled = false;           // Flag: true when listening to temp sensor (auto mode)
+bool  fanOn = false;                    // Fan output shadow state (HIGH when true)
+float current_temp_c = NAN;             // Latest temperature sample for control logic
 
-void setAutoFan(bool enabled) {
-  autoFanEnabled = enabled;
-  // Built-in LED indicates whether we’re listening to the temp sensor (auto fan enabled).
-  digitalWrite(LED_PIN, enabled ? HIGH : LOW);
-  if (!enabled) {
-    // Sleep means fan off regardless of temperature.
-    if (fanOn) {
-      digitalWrite(FAN_PIN, LOW);
-      fanOn = false;
-      Serial.println("[FAN] OFF (sleep)");
+void setAutoFan(bool enabled) {         // Enable/disable auto fan mode and update indicator/fan
+  autoFanEnabled = enabled;             // Remember desired auto mode
+  digitalWrite(LED_PIN, enabled ? HIGH : LOW); // Built-in LED shows auto fan listening state
+  if (!enabled) {                       // If disabling auto mode ("sleep")
+    if (fanOn) {                        // And fan currently on, force it off
+      digitalWrite(FAN_PIN, LOW);       // Drive output LOW to stop fan (assumes active-HIGH)
+      fanOn = false;                    // Update shadow state
+      Serial.println("[FAN] OFF (sleep)"); // Log action for debugging
     }
   } else {
-    Serial.println("[FAN] Auto mode ON");
+    Serial.println("[FAN] Auto mode ON");  // Log we entered auto mode
   }
 }
 
-void controlFanByTemp() {
-  if (!autoFanEnabled || isnan(current_temp_c)) return;
-  const float hi = FAN_TARGET_C + (FAN_HYST_C * 0.5f);
-  const float lo = FAN_TARGET_C - (FAN_HYST_C * 0.5f);
+void controlFanByTemp() {               // Apply simple thermostat control using hysteresis
+  if (!autoFanEnabled || isnan(current_temp_c)) return; // Exit if not in auto or temp invalid
+  const float hi = FAN_TARGET_C + (FAN_HYST_C * 0.5f);  // Upper threshold to turn ON
+  const float lo = FAN_TARGET_C - (FAN_HYST_C * 0.5f);  // Lower threshold to turn OFF
 
-  if (!fanOn && current_temp_c > hi) {
-    digitalWrite(FAN_PIN, HIGH);
-    fanOn = true;
-    Serial.printf("[FAN] ON (T=%.2f > %.2f)\n", current_temp_c, hi);
-  } else if (fanOn && current_temp_c < lo) {
-    digitalWrite(FAN_PIN, LOW);
-    fanOn = false;
-    Serial.printf("[FAN] OFF (T=%.2f < %.2f)\n", current_temp_c, lo);
+  if (!fanOn && current_temp_c > hi) {  // If fan is off and temp exceeded high
+    digitalWrite(FAN_PIN, HIGH);        // Turn fan ON (energize output)
+    fanOn = true;                       // Update shadow state
+    Serial.printf("[FAN] ON (T=%.2f > %.2f)\n", current_temp_c, hi); // Log with numbers
+  } else if (fanOn && current_temp_c < lo) { // If fan is on and temp dropped below low
+    digitalWrite(FAN_PIN, LOW);         // Turn fan OFF
+    fanOn = false;                      // Update shadow state
+    Serial.printf("[FAN] OFF (T=%.2f < %.2f)\n", current_temp_c, lo); // Log with numbers
   }
 }
 
-void applyLight(bool on); // forward declaration
-void ensureWiFi();
-void ensureMqtt();
+void applyLight(bool on);               // Forward declaration so KWS logic can call before defined
+void ensureWiFi();                      // Forward declaration for Wi-Fi helper
+void ensureMqtt();                      // Forward declaration for MQTT helper
 
 // ---------- Audio / KWS ----------
 //
-// Lightweight I²S mic + MFCC + template matching (approximate).
-// - Uses arduinoFFT to compute spectra
-// - 16 kHz mono, 25 ms window, 10 ms hop
-// - 26 mel filters → 13 MFCCs (matches KWS_N_MFCC from wakeword_templates.h)
-// - Classes assumed by template: 0 = wake word, 1 = "lights on", 2 = "lights off"
+// Lightweight I²S mic + MFCC + template matching (approximate).         // Overview of audio pipeline
+// - Uses arduinoFFT to compute spectra                                  // FFT basis
+// - 16 kHz mono, 25 ms window, 10 ms hop                                // Framing parameters
+// - 26 mel filters → 13 MFCCs (matches KWS_N_MFCC from wakeword_templates.h) // Feature dimensions
+// - Classes: 0 = wake, 1 = "lights on", 2 = "lights off"                // Class mapping
 //
-// I²S pin defaults for common INMP441 / ICS-43434 breakout.
-// Change these three if your wiring differs.
 #ifndef I2S_BCLK_PIN
-#define I2S_BCLK_PIN 26
+#define I2S_BCLK_PIN 26                 // I²S bit-clock (SCK/BCLK) pin to mic breakout
 #endif
 #ifndef I2S_WS_PIN
-#define I2S_WS_PIN   25  // aka LRCL
+#define I2S_WS_PIN   25                 // I²S word-select (WS/LRCLK) pin to mic breakout
 #endif
 #ifndef I2S_DOUT_PIN
-#define I2S_DOUT_PIN 33  // mic data out -> ESP32 in
+#define I2S_DOUT_PIN 33                 // I²S data-out from mic to ESP32 (SD/DO)
 #endif
 
 // Audio / feature params
-static const int   KWS_SAMPLE_RATE   = 16000;
-static const int   KWS_FFT_N         = 512;   // power of two
-static const int   KWS_FRAME_LEN     = 400;   // 25 ms @ 16 kHz
-static const int   KWS_HOP_LEN       = 160;   // 10 ms hop
-static const int   KWS_N_FILT        = 26;    // mel filters
-static const int   KWS_MAX_FRAMES    = 300;   // ~3.0 s of history (fits templates up to ~243f)
+static const int   KWS_SAMPLE_RATE   = 16000; // Sample rate in Hz; chosen to match templates
+static const int   KWS_FFT_N         = 512;   // FFT size (power of two) for spectral analysis
+static const int   KWS_FRAME_LEN     = 400;   // Samples per 25 ms frame at 16 kHz (0.025*16000)
+static const int   KWS_HOP_LEN       = 160;   // Hop length 10 ms between consecutive frames
+static const int   KWS_N_FILT        = 26;    // Count of mel filters before DCT to MFCC
+static const int   KWS_MAX_FRAMES    = 300;   // Max MFCC frames kept (~3 s window)
 
 // === KWS debug/toggles ===
-#define KWS_DEBUG 1              // 1 = print classifier/vad info
-#define MIC_RIGHT_CHANNEL 0      // 0 = LEFT (L/R pin to GND), 1 = RIGHT (L/R pin to VCC)
+#define KWS_DEBUG 1                         // 1 enables serial debug prints for KWS internals
+#define MIC_RIGHT_CHANNEL 0                 // 0 read LEFT (mono), 1 read RIGHT (from stereo)
 
-// Utterance-level VAD & decisioning (helps avoid rapid flapping)
-#define VAD_ON            0.0070f     // start speech when RMS rises above this
-#define VAD_OFF           0.0035f     // consider silence when below this
-#define SILENCE_HANG_MS   700         // how long silence must last to end an utterance
-#define CLASS_COOLDOWN_MS 1500        // per-class deadtime to avoid repeats
-#define MARGIN_RATIO      0.92f       // require best/second < this
-#define GAP_MIN           50.0f       // or accept if second-best minus best > this
-#define ABS_DIST_CAP      1e9f        // effectively disabled
-#define MIN_SEG_FRAMES    30          // ignore super short segments (<~0.3 s)
-#define MAX_SEG_FRAMES    280         // clamp overly long segments
-#define ON_MIN_FRAMES     60          // short ON gets treated as wake toggle
+// Utterance-level VAD & decisioning
+#define VAD_ON            0.0070f           // RMS threshold to consider speech starting
+#define VAD_OFF           0.0035f           // RMS threshold to consider speech stopped
+#define SILENCE_HANG_MS   700               // Silence duration to declare end of utterance
+#define CLASS_COOLDOWN_MS 1500              // Per-class cooldown to avoid repeated triggers
+#define MARGIN_RATIO      0.92f             // Require best/second ratio below this
+#define GAP_MIN           50.0f             // Or require absolute gap (second-best − best)
+#define ABS_DIST_CAP      1e9f              // Optional absolute cap (disabled here)
+#define MIN_SEG_FRAMES    30                // Ignore segments shorter than ~0.3 s
+#define MAX_SEG_FRAMES    280               // Clamp over-long segments
+#define ON_MIN_FRAMES     60                // Short “ON” → treat as wake toggle
 
-// Class mapping (aligns with provided templates)
-enum { KWS_CLS_WAKE = 0, KWS_CLS_LIGHTS_ON = 1, KWS_CLS_LIGHTS_OFF = 2 };
+// Class mapping (keep aligned with wakeword_templates.h)
+enum { KWS_CLS_WAKE = 0, KWS_CLS_LIGHTS_ON = 1, KWS_CLS_LIGHTS_OFF = 2 }; // Indices into class scores
 
 // DSP state
-static float hamming[KWS_FRAME_LEN];
-static float dct_m[KWS_N_MFCC * KWS_N_FILT];     // DCT-II matrix (row-major)
-static uint16_t mel_bin_edges[KWS_N_FILT + 2];   // edges in FFT bins
+static float hamming[KWS_FRAME_LEN];                    // Precomputed Hamming window coefficients
+static float dct_m[KWS_N_MFCC * KWS_N_FILT];            // DCT-II matrix (row-major) for 26→13 MFCC
+static uint16_t mel_bin_edges[KWS_N_FILT + 2];          // Mel filter bank FFT bin edges
 
-// ring buffers for streaming MFCCs (most recent first index = last)
-static float mfcc_seq[KWS_MAX_FRAMES][KWS_N_MFCC];
-static int   mfcc_T = 0;  // number of valid frames in mfcc_seq
+// MFCC ring buffer (time axis)
+static float mfcc_seq[KWS_MAX_FRAMES][KWS_N_MFCC];      // Rolling window of MFCC frames
+static int   mfcc_T = 0;                                // Count of valid frames in ring buffer
 
 // Work buffers for FFT
-static double vReal[KWS_FFT_N];
-static double vImag[KWS_FFT_N];
-static ArduinoFFT<double> FFT(vReal, vImag, KWS_FFT_N, KWS_SAMPLE_RATE);
+static double vReal[KWS_FFT_N];                         // Real part buffer for FFT/amps
+static double vImag[KWS_FFT_N];                         // Imag part buffer for FFT (zero for magnitude)
+static ArduinoFFT<double> FFT(vReal, vImag, KWS_FFT_N, KWS_SAMPLE_RATE); // FFT instance bound to buffers
 
 // Utility: Hz<->Mel
-static inline float hz2mel(float hz){ return 2595.0f * log10f(1.0f + hz / 700.0f); }
-static inline float mel2hz(float m){ return 700.0f * (powf(10.0f, m/2595.0f) - 1.0f); }
+static inline float hz2mel(float hz){ return 2595.0f * log10f(1.0f + hz / 700.0f); } // Convert Hz→Mel
+static inline float mel2hz(float m){ return 700.0f * (powf(10.0f, m/2595.0f) - 1.0f); } // Convert Mel→Hz
 
-// Prepare Hamming, mel triangles, DCT-II
-void kws_prepare_dsp() {
-  // Hamming window
-  for (int n = 0; n < KWS_FRAME_LEN; ++n) {
-    hamming[n] = 0.54f - 0.46f * cosf(2.0f * PI * n / (KWS_FRAME_LEN - 1));
+void kws_prepare_dsp() {                               // Precompute window, mel bins, and DCT rows
+  for (int n = 0; n < KWS_FRAME_LEN; ++n) {            // Iterate each time-domain sample index
+    hamming[n] = 0.54f - 0.46f * cosf(2.0f * PI * n / (KWS_FRAME_LEN - 1)); // Hamming window formula
   }
-  // Mel filter bin edges (linearly spaced on mel scale)
-  float mel_lo = hz2mel(0.0f);
-  float mel_hi = hz2mel(KWS_SAMPLE_RATE / 2.0f);
-  for (int m = 0; m < KWS_N_FILT + 2; ++m) {
-    float mel = mel_lo + (mel_hi - mel_lo) * m / (KWS_N_FILT + 1);
-    float hz  = mel2hz(mel);
-    int bin   = (int)floor((KWS_FFT_N + 1) * hz / KWS_SAMPLE_RATE);
-    if (bin < 0) bin = 0;
-    if (bin > KWS_FFT_N/2) bin = KWS_FFT_N/2;
-    mel_bin_edges[m] = (uint16_t)bin;
+  float mel_lo = hz2mel(0.0f);                         // Mel at 0 Hz (low edge)
+  float mel_hi = hz2mel(KWS_SAMPLE_RATE / 2.0f);       // Mel at Nyquist (high edge)
+  for (int m = 0; m < KWS_N_FILT + 2; ++m) {           // Compute mel bin edges for triangular filters
+    float mel = mel_lo + (mel_hi - mel_lo) * m / (KWS_N_FILT + 1); // Linearly spaced in mel domain
+    float hz  = mel2hz(mel);                           // Convert each mel point back to Hz
+    int bin   = (int)floor((KWS_FFT_N + 1) * hz / KWS_SAMPLE_RATE); // Map Hz to FFT bin index
+    if (bin < 0) bin = 0;                              // Clip lower bound
+    if (bin > KWS_FFT_N/2) bin = KWS_FFT_N/2;          // Clip to Nyquist
+    mel_bin_edges[m] = (uint16_t)bin;                  // Store as unsigned short
   }
-  // DCT-II matrix to go from 26 log-mel → 13 MFCC (orthonormal-ish)
-  for (int i = 0; i < KWS_N_MFCC; ++i) {
-    for (int j = 0; j < KWS_N_FILT; ++j) {
-      dct_m[i*KWS_N_FILT + j] = cosf(PI * i * (2*j + 1) / (2.0f * KWS_N_FILT));
+  for (int i = 0; i < KWS_N_MFCC; ++i) {               // Build DCT-II transform rows
+    for (int j = 0; j < KWS_N_FILT; ++j) {             // Iterate mel filter index
+      dct_m[i*KWS_N_FILT + j] = cosf(PI * i * (2*j + 1) / (2.0f * KWS_N_FILT)); // DCT-II basis
     }
   }
 }
 
-// Compute 13-D MFCC for one frame of mono float samples (len=KWS_FRAME_LEN)
-void kws_mfcc_frame(const float *frame, float *out13) {
-  // zero-padded FFT buffer
-  for (int i = 0; i < KWS_FFT_N; ++i) {
-    if (i < KWS_FRAME_LEN) {
-      vReal[i] = (double)(frame[i] * hamming[i]);
+void kws_mfcc_frame(const float *frame, float *out13) { // Compute 13 MFCCs from a windowed frame
+  for (int i = 0; i < KWS_FFT_N; ++i) {                 // Prepare FFT input buffers
+    if (i < KWS_FRAME_LEN) {                            // Inside frame length
+      vReal[i] = (double)(frame[i] * hamming[i]);       // Apply Hamming window to sample
     } else {
-      vReal[i] = 0.0;
+      vReal[i] = 0.0;                                   // Zero-pad beyond frame
     }
-    vImag[i] = 0.0;
+    vImag[i] = 0.0;                                     // Imag part zeroed for real FFT
   }
 
-  FFT.windowing(vReal, KWS_FFT_N, FFT_WIN_TYP_RECTANGLE, FFT_FORWARD); // window already applied
-  FFT.compute(vReal, vImag, KWS_FFT_N, FFT_FORWARD);
-  FFT.complexToMagnitude(vReal, vImag, KWS_FFT_N);
+  FFT.windowing(vReal, KWS_FFT_N, FFT_WIN_TYP_RECTANGLE, FFT_FORWARD); // Keep rectangle since window applied
+  FFT.compute(vReal, vImag, KWS_FFT_N, FFT_FORWARD);    // Perform forward FFT to spectrum
+  FFT.complexToMagnitude(vReal, vImag, KWS_FFT_N);      // Convert complex bins to magnitudes in vReal
 
-  // Power spectrum bins 0..N/2
-  // Triangular mel filters -> 26 energies
-  float e[KWS_N_FILT];
-  for (int m = 0; m < KWS_N_FILT; ++m) {
-    int b0 = mel_bin_edges[m];
-    int b1 = mel_bin_edges[m+1];
-    int b2 = mel_bin_edges[m+2];
-    float sum = 0.0f;
-    if (b0 == b1) b0 = (b0>0?b0-1:b0);
-    if (b1 == b2) b2 = (b2<KWS_FFT_N/2?b2+1:b2);
+  float e[KWS_N_FILT];                                  // Accumulate mel filter energies
+  for (int m = 0; m < KWS_N_FILT; ++m) {                // For each triangular mel filter
+    int b0 = mel_bin_edges[m];                          // Left edge bin
+    int b1 = mel_bin_edges[m+1];                        // Center bin
+    int b2 = mel_bin_edges[m+2];                        // Right edge bin
+    float sum = 0.0f;                                   // Energy accumulator
+    if (b0 == b1) b0 = (b0>0?b0-1:b0);                  // Ensure nonzero width on left slope
+    if (b1 == b2) b2 = (b2<KWS_FFT_N/2?b2+1:b2);        // Ensure nonzero width on right slope
 
-    // rising slope b0..b1
-    for (int k = b0; k < b1; ++k) {
-      float w = (k - b0) / (float)(b1 - b0);
-      float p = (float)vReal[k];  // magnitude
-      sum += (p * p) * w;
+    for (int k = b0; k < b1; ++k) {                     // Rising slope region
+      float w = (k - b0) / (float)(b1 - b0);            // Linear weight from 0→1
+      float p = (float)vReal[k];                        // Magnitude at bin k
+      sum += (p * p) * w;                               // Add weighted power to sum
     }
-    // falling slope b1..b2
-    for (int k = b1; k < b2; ++k) {
-      float w = (b2 - k) / (float)(b2 - b1);
-      float p = (float)vReal[k];
-      sum += (p * p) * w;
+    for (int k = b1; k < b2; ++k) {                     // Falling slope region
+      float w = (b2 - k) / (float)(b2 - b1);            // Linear weight from 1→0
+      float p = (float)vReal[k];                        // Magnitude at bin k
+      sum += (p * p) * w;                               // Add weighted power to sum
     }
-    e[m] = logf(sum + 1e-8f);
+    e[m] = logf(sum + 1e-8f);                           // Log-compress energy to approximate loudness
   }
 
-  // DCT-II to 13 coeffs, drop 0th if you like; here we keep c0..c12
-  for (int i = 0; i < KWS_N_MFCC; ++i) {
-    float acc = 0.0f;
-    const float *row = &dct_m[i*KWS_N_FILT];
-    for (int j = 0; j < KWS_N_FILT; ++j) acc += row[j] * e[j];
-    out13[i] = acc;
+  for (int i = 0; i < KWS_N_MFCC; ++i) {                // DCT-II of log-mels → MFCC coefficients
+    float acc = 0.0f;                                   // Accumulator for dot-product
+    const float *row = &dct_m[i*KWS_N_FILT];            // Pointer to precomputed DCT row i
+    for (int j = 0; j < KWS_N_FILT; ++j) acc += row[j] * e[j]; // Multiply-add across 26 filters
+    out13[i] = acc;                                     // Store MFCC i
   }
 }
 
-// Approximate template distance with CMN, aligning ends and accepting by margin+gap.
-float kws_template_distance_align_end(const float *seq /*T*K*/, int T, int K,
-                                      const int16_t *templ, int L, float scale) {
-  int Lp = (T < L ? T : L);
-  if (Lp <= 0) return 1e30f;
+float kws_template_distance_align_end(const float *seq, int T, int K,
+                                      const int16_t *templ, int L, float scale) { // Distance between last Lp frames of utterance & template (CMN)
+  int Lp = (T < L ? T : L);                             // Number of frames to compare (shorter of both)
+  if (Lp <= 0) return 1e30f;                            // If no overlap, return huge distance
 
-  const int startA = (T - Lp) * K;      // take last Lp frames from the utterance
-  const int startB = (L - Lp) * K;      // take last Lp frames from the template
-  const float invS = 1.0f / scale;
+  const int startA = (T - Lp) * K;                      // Start offset into utterance flattened MFCCs
+  const int startB = (L - Lp) * K;                      // Start offset into template flattened MFCCs
+  const float invS = 1.0f / scale;                      // Inverse of template quantization scale
 
-  // Means (CMN)
-  float meanA[32]; float meanB[32];
-  for (int k = 0; k < K; ++k) { meanA[k] = 0.0f; meanB[k] = 0.0f; }
-  for (int t = 0; t < Lp; ++t) {
-    const float   *a = &seq[startA + t*K];
-    const int16_t *b = &templ[startB + t*K];
+  float meanA[32]; float meanB[32];                     // Storage for mean vectors (max 32 MFCCs)
+  for (int k = 0; k < K; ++k) { meanA[k] = 0.0f; meanB[k] = 0.0f; } // Initialize means
+  for (int t = 0; t < Lp; ++t) {                        // Accumulate sums to compute means (CMN)
+    const float   *a = &seq[startA + t*K];              // Pointer to utterance frame t
+    const int16_t *b = &templ[startB + t*K];            // Pointer to template frame t (int16 quantized)
     for (int k = 0; k < K; ++k) {
-      meanA[k] += a[k];
-      meanB[k] += (float)b[k] * invS;
+      meanA[k] += a[k];                                 // Sum utterance MFCC k
+      meanB[k] += (float)b[k] * invS;                   // Sum de-quantized template MFCC k
     }
   }
-  for (int k = 0; k < K; ++k) { meanA[k] /= (float)Lp; meanB[k] /= (float)Lp; }
+  for (int k = 0; k < K; ++k) { meanA[k] /= (float)Lp; meanB[k] /= (float)Lp; } // Average to get means
 
-  // Distance
-  float acc = 0.0f;
-  for (int t = 0; t < Lp; ++t) {
-    const float   *a = &seq[startA + t*K];
-    const int16_t *b = &templ[startB + t*K];
+  float acc = 0.0f;                                     // Distance accumulator
+  for (int t = 0; t < Lp; ++t) {                        // Iterate frames to compute CMN distance
+    const float   *a = &seq[startA + t*K];              // Utterance frame pointer
+    const int16_t *b = &templ[startB + t*K];            // Template frame pointer
     for (int k = 0; k < K; ++k) {
-      float av = a[k] - meanA[k];
-      float bv = (float)b[k] * invS - meanB[k];
-      float d  = av - bv;
-      acc += d * d;
+      float av = a[k] - meanA[k];                       // CMN: subtract utterance mean
+      float bv = (float)b[k] * invS - meanB[k];         // CMN: subtract template mean
+      float d  = av - bv;                               // Difference for coefficient k
+      acc += d * d;                                     // Accumulate squared distance
     }
   }
-  return acc / (float)(Lp * K);
+  return acc / (float)(Lp * K);                         // Average per coefficient per frame
 }
 
-// Classify a specific MFCC slice (utterance)
-int kws_classify_segment(int startT, int endT, float *bestOut, float *secondOut) {
-  int T = endT - startT;
-  if (T < MIN_SEG_FRAMES) return -1;
-  if (T > MAX_SEG_FRAMES) T = MAX_SEG_FRAMES; // clamp
+int kws_classify_segment(int startT, int endT, float *bestOut, float *secondOut) { // Classify one utterance slice
+  int T = endT - startT;                                // Segment length in frames
+  if (T < MIN_SEG_FRAMES) return -1;                    // Ignore too-short segments
+  if (T > MAX_SEG_FRAMES) T = MAX_SEG_FRAMES;           // Clamp too-long segments
 
-  static float flat[KWS_MAX_FRAMES * KWS_N_MFCC];
-  for (int t = 0; t < T; ++t) {
+  static float flat[KWS_MAX_FRAMES * KWS_N_MFCC];       // Flattened buffer (T×K)
+  for (int t = 0; t < T; ++t) {                         // Copy slice into contiguous array
     for (int k = 0; k < KWS_N_MFCC; ++k) {
-      flat[t*KWS_N_MFCC + k] = mfcc_seq[startT + t][k];
+      flat[t*KWS_N_MFCC + k] = mfcc_seq[startT + t][k]; // Flatten frame by frame
     }
   }
 
-  float bestByClass[3] = {1e30f, 1e30f, 1e30f};
-  for (int ti = 0; ti < KWS_NUM_TEMPLATES; ++ti) {
-    int cls   = KWS_TEMPL_CLASS_IDX[ti];
-    int L     = KWS_TEMPL_FRAMES[ti];
-    int K     = KWS_TEMPL_COEFFS[ti];
-    int off   = (int)KWS_TEMPL_OFFSET[ti];
-    const int16_t *td = &KWS_TEMPL_DATA[off];
-    float sc   = KWS_TEMPL_SCALE[ti];
+  float bestByClass[3] = {1e30f, 1e30f, 1e30f};         // Per-class best distances initialized high
+  for (int ti = 0; ti < KWS_NUM_TEMPLATES; ++ti) {      // Iterate all stored templates
+    int cls   = KWS_TEMPL_CLASS_IDX[ti];                // Template's class index
+    int L     = KWS_TEMPL_FRAMES[ti];                   // Template length (frames)
+    int K     = KWS_TEMPL_COEFFS[ti];                   // Coefficients per frame (MFCC count)
+    int off   = (int)KWS_TEMPL_OFFSET[ti];              // Offset into packed template data array
+    const int16_t *td = &KWS_TEMPL_DATA[off];           // Pointer to template MFCC data (int16)
+    float sc   = KWS_TEMPL_SCALE[ti];                   // Scale factor to de-quantize back to float
 
-    float d = kws_template_distance_align_end(flat, T, K, td, L, sc);
-    if (d < bestByClass[cls]) bestByClass[cls] = d;
+    float d = kws_template_distance_align_end(flat, T, K, td, L, sc); // Compute end-aligned CMN distance
+    if (d < bestByClass[cls]) bestByClass[cls] = d;     // Keep the best distance for this class
   }
 
-  int winner = -1;
-  float best = 1e30f, second = 1e30f;
-  for (int c = 0; c < 3; ++c) {
-    float d = bestByClass[c];
-    if (d < best) { second = best; best = d; winner = c; }
-    else if (d < second) { second = d; }
+  int winner = -1;                                      // Class with smallest distance
+  float best = 1e30f, second = 1e30f;                   // Track best and second-best distances
+  for (int c = 0; c < 3; ++c) {                         // Evaluate classes
+    float d = bestByClass[c];                           // Distance for class c
+    if (d < best) { second = best; best = d; winner = c; } // Update winners
+    else if (d < second) { second = d; }                // Update runner-up
   }
-  if (bestOut) *bestOut = best;
-  if (secondOut) *secondOut = second;
+  if (bestOut) *bestOut = best;                         // Return best distance if requested
+  if (secondOut) *secondOut = second;                   // Return second-best if requested
 
-  // Relative + absolute gap acceptance
-  float ratio = (second > 0.0f) ? (best / second) : 0.0f;
-  float gap   = (second > 0.0f) ? (second - best) : 0.0f;
+  float ratio = (second > 0.0f) ? (best / second) : 0.0f; // Relative margin (lower better)
+  float gap   = (second > 0.0f) ? (second - best) : 0.0f; // Absolute gap
 
-  // Optional length sanity (helps avoid odd segments)
-  int seg_len = T;  // MFCC frames in the utterance
-  bool len_ok = true;
-  if (winner == KWS_CLS_LIGHTS_ON)  len_ok = (seg_len >= 40 && seg_len <= 120);
-  if (winner == KWS_CLS_LIGHTS_OFF) len_ok = (seg_len >= 45 && seg_len <= 140);
+  int seg_len = T;                                      // Cache segment length
+  bool len_ok = true;                                   // Assume length ok
+  if (winner == KWS_CLS_LIGHTS_ON)  len_ok = (seg_len >= 40 && seg_len <= 120);  // Heuristic for ON
+  if (winner == KWS_CLS_LIGHTS_OFF) len_ok = (seg_len >= 45 && seg_len <= 140);  // Heuristic for OFF
 
   if (winner >= 0
       && len_ok
       && (ratio < MARGIN_RATIO || gap > GAP_MIN)
-      && best < ABS_DIST_CAP) {
-    return winner;
+      && best < ABS_DIST_CAP) {                         // Accept if passes all heuristics
+    return winner;                                      // Return predicted class index
   }
-  return -1;
+  return -1;                                            // Otherwise reject segment
 }
 
 // I²S mic init + non-blocking sample → frame → MFCC pipeline
-static int   hop_accum = 0;
-static float frame_buf[KWS_FRAME_LEN];   // sliding window time-domain
-static float vad_rms = 0.0f;             // tiny VAD just to skip silence
+static int   hop_accum = 0;                             // Position in current frame buffer
+static float frame_buf[KWS_FRAME_LEN];                  // Sliding time-domain window buffer
+static float vad_rms = 0.0f;                            // Exponential RMS VAD tracker
 
 // Utterance state (for endpointing)
-static bool     in_speech = false;
-static uint32_t silence_since = 0;
-static int      seg_start_T = 0;
-static uint32_t last_trigger_ms[3] = {0,0,0};
+static bool     in_speech = false;                      // True while inside a speech segment
+static uint32_t silence_since = 0;                      // Timestamp when we first saw silence
+static int      seg_start_T = 0;                        // Start index (in MFCC frames) of utterance
+static uint32_t last_trigger_ms[3] = {0,0,0};           // Cooldown timestamps per class
 
-bool kws_init_i2s() {
-  // I²S peripheral in RX, 32-bit samples (many I²S mics are 24-bit left-aligned)
-  i2s_config_t cfg = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-    .sample_rate = KWS_SAMPLE_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-    // .channel_format = ...   // (intentionally omitted; we set it with i2s_set_clk)
-    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-    .intr_alloc_flags = 0,
-    .dma_buf_count = 6,
-    .dma_buf_len = 256,
-    .use_apll = false,
-    .tx_desc_auto_clear = false,
-    .fixed_mclk = 0
+bool kws_init_i2s() {                                   // Bring up I²S in RX mode for the mic
+  i2s_config_t cfg = {                                  // Configure I²S driver parameters
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),// ESP32 provides clock, receives data
+    .sample_rate = KWS_SAMPLE_RATE,                     // 16 kHz sample rate
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,       // 32-bit container (mic is 24-bit left-aligned)
+    // .channel_format = ...                             // Set later with i2s_set_clk to pick mono/stereo
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,  // Standard I²S framing
+    .intr_alloc_flags = 0,                              // Default interrupt allocation
+    .dma_buf_count = 6,                                 // DMA buffers for smooth streaming
+    .dma_buf_len = 256,                                 // Samples per DMA buffer
+    .use_apll = false,                                  // No APLL (use default clocking)
+    .tx_desc_auto_clear = false,                        // TX not used (recording only)
+    .fixed_mclk = 0                                     // Let driver select MCLK if needed
   };
 
-  i2s_pin_config_t pins = {
-    .bck_io_num   = I2S_BCLK_PIN,  // SCK/BCLK
-    .ws_io_num    = I2S_WS_PIN,    // WS/LRCLK
-    .data_out_num = -1,
-    .data_in_num  = I2S_DOUT_PIN   // SD/DO from mic
+  i2s_pin_config_t pins = {                             // Map I²S pins to GPIO
+    .bck_io_num   = I2S_BCLK_PIN,                       // BCLK/SCK pin
+    .ws_io_num    = I2S_WS_PIN,                         // LRCLK/WS pin
+    .data_out_num = -1,                                 // No TX (not transmitting audio)
+    .data_in_num  = I2S_DOUT_PIN                        // Data-in connected to mic DO/SD
   };
 
-  if (i2s_driver_install(I2S_NUM_0, &cfg, 0, nullptr) != ESP_OK) {
-    Serial.println("[KWS] i2s_driver_install failed");
-    return false;
+  if (i2s_driver_install(I2S_NUM_0, &cfg, 0, nullptr) != ESP_OK) { // Install I²S driver on port 0
+    Serial.println("[KWS] i2s_driver_install failed");  // Log failure
+    return false;                                       // Abort mic
   }
-  if (i2s_set_pin(I2S_NUM_0, &pins) != ESP_OK) {
-    Serial.println("[KWS] i2s_set_pin failed");
-    return false;
+  if (i2s_set_pin(I2S_NUM_0, &pins) != ESP_OK) {        // Apply pin mapping to driver
+    Serial.println("[KWS] i2s_set_pin failed");         // Log failure
+    return false;                                       // Abort mic
   }
 
-  // Select mono (LEFT) or stereo (so we can pick RIGHT in software)
-  if (MIC_RIGHT_CHANNEL) {
-    i2s_set_clk(I2S_NUM_0, KWS_SAMPLE_RATE, I2S_BITS_PER_SAMPLE_32BIT, I2S_CHANNEL_STEREO);
-    Serial.printf("[KWS] I2S stereo @%d Hz (picking RIGHT)\n", KWS_SAMPLE_RATE);
+  if (MIC_RIGHT_CHANNEL) {                              // If using RIGHT channel from stereo
+    i2s_set_clk(I2S_NUM_0, KWS_SAMPLE_RATE, I2S_BITS_PER_SAMPLE_32BIT, I2S_CHANNEL_STEREO); // Stereo mode
+    Serial.printf("[KWS] I2S stereo @%d Hz (picking RIGHT)\n", KWS_SAMPLE_RATE); // Announce mode
   } else {
-    i2s_set_clk(I2S_NUM_0, KWS_SAMPLE_RATE, I2S_BITS_PER_SAMPLE_32BIT, I2S_CHANNEL_MONO);
-    Serial.printf("[KWS] I2S mono-left @%d Hz\n", KWS_SAMPLE_RATE);
+    i2s_set_clk(I2S_NUM_0, KWS_SAMPLE_RATE, I2S_BITS_PER_SAMPLE_32BIT, I2S_CHANNEL_MONO);   // Mono LEFT
+    Serial.printf("[KWS] I2S mono-left @%d Hz\n", KWS_SAMPLE_RATE); // Announce mode
   }
 
-  i2s_zero_dma_buffer(I2S_NUM_0);
-  return true;
+  i2s_zero_dma_buffer(I2S_NUM_0);                       // Clear DMA buffers to known state
+  return true;                                          // Mic ready
 }
 
-// Read mic, build MFCC stream, do utterance-level classification
-void kws_process_audio() {
-  // Pull a small chunk each loop; convert 32-bit I²S sample to float [-1,1]
-  int32_t raw[128];
-  size_t nbytes = 0;
-  if (i2s_read(I2S_NUM_0, (void*)raw, sizeof(raw), &nbytes, 0) != ESP_OK) return;
-  int n = nbytes / sizeof(raw[0]);
-  if (n <= 0) return;
+void kws_process_audio() {                              // Main audio ISR-like pump (called in loop)
+  int32_t raw[128];                                     // Buffer for raw 32-bit I²S words
+  size_t nbytes = 0;                                    // Byte count actually read
+  if (i2s_read(I2S_NUM_0, (void*)raw, sizeof(raw), &nbytes, 0) != ESP_OK) return; // Non-blocking read
+  int n = nbytes / sizeof(raw[0]);                      // Convert bytes to sample count
+  if (n <= 0) return;                                   // Nothing to process
 
-  const int start  = MIC_RIGHT_CHANNEL ? 1 : 0;   // 0=LEFT (mono or stereo), 1=RIGHT (stereo)
-  const int stride = MIC_RIGHT_CHANNEL ? 2 : 1;   // step by 2 if stereo interleaved
+  const int start  = MIC_RIGHT_CHANNEL ? 1 : 0;         // Starting index (RIGHT channel if stereo)
+  const int stride = MIC_RIGHT_CHANNEL ? 2 : 1;         // Step over interleaved stereo if needed
 
-  for (int i = start; i < n; i += stride) {
-    // 24-bit left-aligned in 32-bit frame (INMP441/ICS-43434 style)
-    int32_t s24 = (raw[i] >> 8);                 // sign-extend 24-bit
-    float   s   = (float)s24 / 8388607.0f;       // normalize to [-1,1]
+  for (int i = start; i < n; i += stride) {             // Iterate samples of the chosen channel
+    int32_t s24 = (raw[i] >> 8);                        // Shift to sign-extend 24-bit sample
+    float   s   = (float)s24 / 8388607.0f;              // Normalize 24-bit to float in [-1,1]
 
-    // simple clamp
-    if (s > 1.5f) s = 1.5f;
-    if (s < -1.5f) s = -1.5f;
+    if (s > 1.5f) s = 1.5f;                             // Clamp extreme spikes (basic protection)
+    if (s < -1.5f) s = -1.5f;                           // Clamp negative spikes
 
-    // push into sliding frame buffer with hop logic
-    if (hop_accum < KWS_FRAME_LEN) {
-      frame_buf[hop_accum] = s;
-      hop_accum++;
+    if (hop_accum < KWS_FRAME_LEN) {                    // Fill the current 25 ms frame buffer
+      frame_buf[hop_accum] = s;                         // Store sample into frame
+      hop_accum++;                                      // Advance frame cursor
     }
 
-    if (hop_accum == KWS_FRAME_LEN) {
-      // compute VAD on frame
-      float rms = 0.0f;
-      for (int k = 0; k < KWS_FRAME_LEN; ++k) rms += frame_buf[k]*frame_buf[k];
-      rms = sqrtf(rms / KWS_FRAME_LEN);
-      vad_rms = 0.95f*vad_rms + 0.05f*rms;
+    if (hop_accum == KWS_FRAME_LEN) {                   // When we complete one frame
+      float rms = 0.0f;                                 // Local RMS accumulator
+      for (int k = 0; k < KWS_FRAME_LEN; ++k) rms += frame_buf[k]*frame_buf[k]; // Sum squares
+      rms = sqrtf(rms / KWS_FRAME_LEN);                 // RMS = sqrt(mean of squares)
+      vad_rms = 0.95f*vad_rms + 0.05f*rms;              // Exponential smoothing for VAD
 
-      // Always compute MFCCs for the frame; manage ring & seg_start shifts safely
-      float coeffs[KWS_N_MFCC];
-      kws_mfcc_frame(frame_buf, coeffs);
-      if (mfcc_T < KWS_MAX_FRAMES) {
-        for (int k = 0; k < KWS_N_MFCC; ++k) mfcc_seq[mfcc_T][k] = coeffs[k];
-        mfcc_T++;
-      } else {
-        // shift left; keep seg_start_T anchored to new indices
+      float coeffs[KWS_N_MFCC];                         // Output buffer for MFCCs
+      kws_mfcc_frame(frame_buf, coeffs);                // Compute MFCCs for this frame
+      if (mfcc_T < KWS_MAX_FRAMES) {                    // If ring buffer not full
+        for (int k = 0; k < KWS_N_MFCC; ++k) mfcc_seq[mfcc_T][k] = coeffs[k]; // Append frame
+        mfcc_T++;                                       // Increase valid frame count
+      } else {                                          // If ring buffer full, shift left by one
         for (int t = 0; t < KWS_MAX_FRAMES-1; ++t) {
-          memcpy(mfcc_seq[t], mfcc_seq[t+1], sizeof(mfcc_seq[t]));
+          memcpy(mfcc_seq[t], mfcc_seq[t+1], sizeof(mfcc_seq[t])); // Move older frames
         }
-        memcpy(mfcc_seq[KWS_MAX_FRAMES-1], coeffs, sizeof(coeffs));
-        if (in_speech && seg_start_T > 0) seg_start_T--;
+        memcpy(mfcc_seq[KWS_MAX_FRAMES-1], coeffs, sizeof(coeffs)); // Put newest at end
+        if (in_speech && seg_start_T > 0) seg_start_T--; // Keep start index aligned after shift
       }
 
-      // --- Utterance state machine (start/stop on VAD with hysteresis) ---
-      uint32_t now = millis();
-      if (!in_speech) {
-        if (vad_rms >= VAD_ON) {
-          in_speech = true;
-          seg_start_T = max(0, mfcc_T - 1);  // start near this frame
-          silence_since = 0;
+      uint32_t now = millis();                          // Current time for hang/cooldown logic
+      if (!in_speech) {                                 // If currently not speaking
+        if (vad_rms >= VAD_ON) {                        // Threshold crossed upward → start speech
+          in_speech = true;                              // Enter speech state
+          seg_start_T = max(0, mfcc_T - 1);             // Mark start near current frame
+          silence_since = 0;                             // Reset silence timer
         }
-      } else {
-        if (vad_rms < VAD_OFF) {
-          if (silence_since == 0) silence_since = now;
-          // if we've been silent long enough → end utterance and classify once
-          if (now - silence_since >= SILENCE_HANG_MS) {
-            int seg_end_T = mfcc_T; // up to current
-            int seg_len   = seg_end_T - seg_start_T;
+      } else {                                          // Currently in speech
+        if (vad_rms < VAD_OFF) {                        // Fell below off threshold (silence)
+          if (silence_since == 0) silence_since = now;  // Start silence hang timer on first entry
+          if (now - silence_since >= SILENCE_HANG_MS) { // If long enough silence → end utterance
+            int seg_end_T = mfcc_T;                     // End index (one past last frame)
+            int seg_len   = seg_end_T - seg_start_T;    // Utterance length in frames
 
-            float d1=0, d2=0;
+            float d1=0, d2=0;                           // Distances for debug
             int cls = (seg_len >= MIN_SEG_FRAMES)
-                      ? kws_classify_segment(seg_start_T, seg_end_T, &d1, &d2)
-                      : -1;
+                      ? kws_classify_segment(seg_start_T, seg_end_T, &d1, &d2) // Classify the segment
+                      : -1;                              // Too short → reject
 
             #if KWS_DEBUG
               Serial.printf("[KWS] SEG end: cls=%d best=%.2f second=%.2f frames=%d\n",
-                            cls, d1, d2, seg_len);
+                            cls, d1, d2, seg_len);      // Print classification result
             #endif
 
-            if (cls >= 0 && (now - last_trigger_ms[cls] >= CLASS_COOLDOWN_MS)) {
-              last_trigger_ms[cls] = now;
+            if (cls >= 0 && (now - last_trigger_ms[cls] >= CLASS_COOLDOWN_MS)) { // Debounce per class
+              last_trigger_ms[cls] = now;               // Arm cooldown
 
-              if (cls == KWS_CLS_WAKE) {
-                // Toggle auto fan: wake → ready (ON), wake again → sleep (OFF)
-                bool newState = !autoFanEnabled;
-                setAutoFan(newState);
-                Serial.println(newState ? "ready" : "sleep");
+              if (cls == KWS_CLS_WAKE) {                // Wake toggles auto-fan mode
+                bool newState = !autoFanEnabled;        // Flip mode
+                setAutoFan(newState);                   // Apply indicator + fan/sleep behavior
+                Serial.println(newState ? "ready" : "sleep"); // Print acknowledgement
 
-              } else if (cls == KWS_CLS_LIGHTS_ON) {
-                // If this “ON” is very short, it’s probably the wakeword → toggle auto fan instead
-                if (seg_len < ON_MIN_FRAMES) {
-                  bool newState = !autoFanEnabled;
-                  setAutoFan(newState);
-                  Serial.println(newState ? "ready" : "sleep");
+              } else if (cls == KWS_CLS_LIGHTS_ON) {    // Lights ON detected
+                if (seg_len < ON_MIN_FRAMES) {          // If very short, treat as wake fallback
+                  bool newState = !autoFanEnabled;      // Toggle auto mode instead of lights
+                  setAutoFan(newState);                 // Apply
+                  Serial.println(newState ? "ready" : "sleep"); // Report
                   #if KWS_DEBUG
-                    Serial.printf("[KWS] ON->WAKE fallback (seg_len=%d)\n", seg_len);
+                    Serial.printf("[KWS] ON->WAKE fallback (seg_len=%d)\n", seg_len); // Explain fallback
                   #endif
                 } else {
-                  applyLight(true);     // external LED ON
+                  applyLight(true);                     // Drive external LED ON and publish status
                 }
 
-              } else if (cls == KWS_CLS_LIGHTS_OFF) {
-                applyLight(false);      // external LED OFF
+              } else if (cls == KWS_CLS_LIGHTS_OFF) {   // Lights OFF detected
+                applyLight(false);                      // Drive external LED OFF and publish status
               }
             }
-            in_speech = false;
-            silence_since = 0;
+            in_speech = false;                          // Reset speech state after classification
+            silence_since = 0;                          // Clear silence timer
           }
         } else {
-          // still speaking
-          silence_since = 0;
+          silence_since = 0;                            // If voice continues, keep resetting timer
         }
       }
 
-      // slide by hop: move last (FRAME_LEN - HOP_LEN) samples down
-      memmove(frame_buf, frame_buf + KWS_HOP_LEN, sizeof(float) * (KWS_FRAME_LEN - KWS_HOP_LEN));
-      hop_accum = KWS_FRAME_LEN - KWS_HOP_LEN;
+      memmove(frame_buf,                                // Slide window by hop (overlap-add style)
+              frame_buf + KWS_HOP_LEN,
+              sizeof(float) * (KWS_FRAME_LEN - KWS_HOP_LEN)); // Shift retained samples
+      hop_accum = KWS_FRAME_LEN - KWS_HOP_LEN;          // Set new cursor position after shift
     }
   }
 }
 
 // ---------- Helpers ----------
 
-// Turns the light on/off, updates hardware pin, and publishes retained status.
-void applyLight(bool on) {
-  // Quick exit if requested state equals the current state (avoids redundant writes/publishes).
-  if (on == lightOn) return;
-  // Remember the new state so logic/UI stay in sync.
-  lightOn = on;
-  // Drive the *external* LED pin HIGH for on and LOW for off.
-  digitalWrite(LED_LIGHT_PIN, on ? HIGH : LOW);
-  // Publish the new light status as a retained message so subscribers/Dashboard get it immediately.
-  mqtt.publish(TOPIC_LIGHT_STATUS, on ? "ON" : "OFF", true); // retained
-  // Print to serial for human-readable debugging.
-  Serial.printf("[STATE] lightOn=%s\n", on ? "ON" : "OFF");
+void applyLight(bool on) {                              // Toggle external LED and publish status
+  if (on == lightOn) return;                            // No change → no work
+  lightOn = on;                                         // Update shadow state
+  digitalWrite(LED_LIGHT_PIN, on ? HIGH : LOW);         // Write GPIO to drive LED on/off
+  mqtt.publish(TOPIC_LIGHT_STATUS, on ? "ON" : "OFF", true); // Publish retained status to broker
+  Serial.printf("[STATE] lightOn=%s\n", on ? "ON" : "OFF"); // Log state
 }
 
-// Handles every MQTT message we receive; routes by topic and parses payload.
-void onMsg(char* topic, byte* payload, unsigned int len) {
-  // Local buffer to copy the incoming payload into (adds a null terminator for safe string ops).
-  char buf[16];
-  // Clamp copy count to buffer size minus 1 so we never overflow.
-  size_t n = min(len, (unsigned int)sizeof(buf) - 1);
-  // Copy raw bytes from MQTT payload to our local buffer.
-  memcpy(buf, payload, n);
-  // Manually terminate with '\0' so we can treat it as a C string.
-  buf[n] = '\0';
-  // Log the topic and text payload so we can see what arrived.
-  Serial.printf("[MQTT] %s <- '%s'\n", topic, buf);
+void onMsg(char* topic, byte* payload, unsigned int len) { // MQTT callback for all subscribed topics
+  char buf[16];                                         // Temporary string buffer for payload
+  size_t n = min(len, (unsigned int)sizeof(buf) - 1);   // Clamp copy to buffer capacity
+  memcpy(buf, payload, n);                              // Copy raw bytes into local buffer
+  buf[n] = '\0';                                        // Null-terminate so it's a C-string
+  Serial.printf("[MQTT] %s <- '%s'\n", topic, buf);     // Log incoming message for debugging
 
-  // If the message is for the lights/set topic, interpret it as a command.
-  if (strcmp(topic, TOPIC_LIGHT_SET) == 0) {
-    // Uppercase the payload in-place to make comparisons case-insensitive.
-    for (size_t i = 0; i < n; ++i) buf[i] = (char)toupper((unsigned char)buf[i]);
-    // If payload equals any “true/on” variants, turn the light on.
-    if (!strcmp(buf, "ON") || !strcmp(buf, "1") || !strcmp(buf, "TRUE")) {
-      applyLight(true);
-    // If payload equals any “false/off” variants, turn the light off.
-    } else if (!strcmp(buf, "OFF") || !strcmp(buf, "0") || !strcmp(buf, "FALSE")) {
-      applyLight(false);
-    // Otherwise, it’s unrecognized input; warn but do nothing.
+  if (strcmp(topic, TOPIC_LIGHT_SET) == 0) {            // If command is for lights/set
+    for (size_t i = 0; i < n; ++i) buf[i] = (char)toupper((unsigned char)buf[i]); // Uppercase for case-insensitive compare
+    if (!strcmp(buf, "ON") || !strcmp(buf, "1") || !strcmp(buf, "TRUE")) { // On tokens
+      applyLight(true);                                 // Turn lights on
+    } else if (!strcmp(buf, "OFF") || !strcmp(buf, "0") || !strcmp(buf, "FALSE")) { // Off tokens
+      applyLight(false);                                // Turn lights off
     } else {
-      Serial.printf("[WARN] Unknown payload on lights/set: '%s'\n", buf);
+      Serial.printf("[WARN] Unknown payload on lights/set: '%s'\n", buf); // Warn on unknown command
     }
   }
 }
 
-// Ensures we’re connected to Wi-Fi; if not, it blocks until association succeeds.
-void ensureWiFi() {
-  // If already connected, there’s nothing to do.
-  if (WiFi.status() == WL_CONNECTED) return;
-  // Put the radio in “station” (client) mode so we can join an AP.
-  WiFi.mode(WIFI_STA);
-  // Start connecting with the provided SSID/password.
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  // Print a progress indicator while waiting for DHCP/association.
-  Serial.print("[WiFi] Connecting");
-  // Loop until Wi-Fi says we’re connected.
-  while (WiFi.status() != WL_CONNECTED) {
-    // Small delay to avoid busy-waiting; also gives the radio time to work.
-    delay(250);
-    // Emit a dot so we can see connection progress in the serial monitor.
-    Serial.print(".");
+// ---------- Connectivity ----------
+
+void ensureWiFi() {                                     // Connect to Wi-Fi if not already connected
+  if (WiFi.status() == WL_CONNECTED) return;            // Early exit if already connected
+  WiFi.mode(WIFI_STA);                                  // Station mode to join AP
+  WiFi.begin(WIFI_SSID, WIFI_PASS);                     // Start association with credentials
+  Serial.print("[WiFi] Connecting");                    // Progress log
+  while (WiFi.status() != WL_CONNECTED) {               // Loop until connected
+    delay(250);                                         // Small delay to yield CPU/radio
+    Serial.print(".");                                  // Visual progress dots
   }
-  // Once connected, print the IP address and the signal strength (RSSI).
   Serial.printf("\n[WiFi] Connected. IP=%s, RSSI=%d dBm\n",
-                WiFi.localIP().toString().c_str(), WiFi.RSSI());
+                WiFi.localIP().toString().c_str(), WiFi.RSSI()); // Print DHCP IP and signal strength
 }
 
-// Optional creds (leave as nullptr if anonymous)
+// Optional creds (compile-time overrides or defaults)
 #ifndef MQTT_USER
-  #define MQTT_USER nullptr
-  #define MQTT_PASS nullptr
+  #define MQTT_USER nullptr                              // Default to anonymous if not defined
+  #define MQTT_PASS nullptr                              // Default to anonymous if not defined
 #endif
 
-void ensureMqtt() {
-  if (mqtt.connected()) return;
+void ensureMqtt() {                                     // Connect/reconnect to MQTT broker
+  if (mqtt.connected()) return;                         // Early exit if already connected
 
-  // Resolve hostname/IP → numeric IP (works for both IP strings & names)
-  IPAddress hostIP;
-  if (!WiFi.hostByName(MQTT_HOST, hostIP)) {
-    Serial.printf("[MQTT] RESOLVE FAIL for '%s'\n", MQTT_HOST);
-    delay(1000);
-    return;
+  IPAddress hostIP;                                     // Will hold resolved numeric IP
+  if (!WiFi.hostByName(MQTT_HOST, hostIP)) {            // DNS or literal IP resolution
+    Serial.printf("[MQTT] RESOLVE FAIL for '%s'\n", MQTT_HOST); // Log failure
+    delay(1000);                                        // Backoff
+    return;                                             // Try again next loop
   }
   Serial.printf("[MQTT] HOST '%s' -> %s:%u\n",
-                MQTT_HOST, hostIP.toString().c_str(), MQTT_PORT);
+                MQTT_HOST, hostIP.toString().c_str(), MQTT_PORT); // Show resolved address
 
-  // Quick TCP probe (firewall / reachability)
-  WiFiClient probe;
-  Serial.print("[MQTT] TCP CONNECT ... ");
-  if (!probe.connect(hostIP, MQTT_PORT)) {
-    Serial.println("NO TCP (wrong IP / firewall)");
-    delay(1000);
-    return;
+  WiFiClient probe;                                     // Short-lived TCP probe client
+  Serial.print("[MQTT] TCP CONNECT ... ");              // Announce probe
+  if (!probe.connect(hostIP, MQTT_PORT)) {              // Try to open TCP socket to broker
+    Serial.println("NO TCP (wrong IP / firewall)");     // Failed connect (network or firewall)
+    delay(1000);                                        // Backoff
+    return;                                             // Exit to retry later
   }
-  Serial.println("OK");
-  probe.stop();
+  Serial.println("OK");                                 // TCP reachable
+  probe.stop();                                         // Close probe socket
 
-  // Actual MQTT connect (auth)
-  mqtt.setServer(hostIP, MQTT_PORT);
-  mqtt.setSocketTimeout(4);
-  mqtt.setKeepAlive(20);
+  mqtt.setServer(hostIP, MQTT_PORT);                    // Point MQTT client to resolved host/port
+  mqtt.setSocketTimeout(4);                             // Shorter socket timeouts for snappier retries
+  mqtt.setKeepAlive(20);                                // MQTT keepalive interval (seconds)
 
-  String clientId = "esp32-env-" + String((uint32_t)ESP.getEfuseMac(), HEX);
-  Serial.print("[MQTT] MQTT CONNECT ... ");
-  bool ok = mqtt.connect(clientId.c_str(),
+  String clientId = "esp32-env-" + String((uint32_t)ESP.getEfuseMac(), HEX); // Unique-ish clientID
+  Serial.print("[MQTT] MQTT CONNECT ... ");             // Announce real MQTT connect
+  bool ok = mqtt.connect(clientId.c_str(),              // Connect with LWT on env/status
                          MQTT_USER, MQTT_PASS,
                          TOPIC_ENV_STATUS, 0, true, "offline");
-  if (!ok) {
-    Serial.printf("FAIL state=%d\n", mqtt.state()); // -4 timeout, -2 refused, 5 not authorized
-    delay(1000);
-    return;
+  if (!ok) {                                            // If connect failed
+    Serial.printf("FAIL state=%d\n", mqtt.state());     // Print reason code for diagnostics
+    delay(1000);                                        // Backoff
+    return;                                             // Try again in next loop
   }
 
-  Serial.println("OK");
-  mqtt.subscribe(TOPIC_LIGHT_SET);
-  mqtt.publish(TOPIC_LIGHT_STATUS, lightOn ? "ON" : "OFF", true);
-  mqtt.publish(TOPIC_ENV_STATUS, "online", true);
+  Serial.println("OK");                                 // Connected to broker
+  mqtt.subscribe(TOPIC_LIGHT_SET);                      // Subscribe to lights control topic
+  mqtt.publish(TOPIC_LIGHT_STATUS, lightOn ? "ON" : "OFF", true); // Publish initial lights state (retained)
+  mqtt.publish(TOPIC_ENV_STATUS, "online", true);       // Set status retained to "online"
 }
 
-// Publishes environmental readings as both a JSON blob and individual retained topics.
-void publish_env(float t, float h, float p) {
-  // Build a compact JSON string including Wi-Fi RSSI for quick diagnostics.
-  char json[160];
-  snprintf(json, sizeof(json),
+void publish_env(float t, float h, float p) {           // Publish JSON snapshot and scalar topics
+  char json[160];                                       // Temp buffer for JSON string
+  snprintf(json, sizeof(json),                          // Compose compact JSON payload
            "{\"temp_c\":%.2f,\"humidity\":%.2f,\"pressure_hpa\":%.2f,\"rssi\":%d}",
-           t, h, p, WiFi.RSSI());
-  // Publish the JSON snapshot and retain it so dashboards can fetch the last known on load.
-  mqtt.publish(TOPIC_ENV_STATE, json, true);
+           t, h, p, WiFi.RSSI());                       // Include Wi-Fi RSSI for quick diagnostics
+  mqtt.publish(TOPIC_ENV_STATE, json, true);            // Publish retained JSON snapshot
 
-  // Prepare a generic buffer for printing scalar floats as strings.
-  char buf[32];
-  // Convert temperature to text and publish/retain under a dedicated topic (good for simple gauges).
-  dtostrf(t, 0, 2, buf); mqtt.publish(TOPIC_ENV_TEMP, buf, true);
-  // Convert humidity to text and publish/retain.
-  dtostrf(h, 0, 2, buf); mqtt.publish(TOPIC_ENV_HUM,  buf, true);
-  // Convert pressure to text and publish/retain.
-  dtostrf(p, 0, 2, buf); mqtt.publish(TOPIC_ENV_PRES, buf, true);
+  char buf[32];                                         // Buffer for scalar conversions
+  dtostrf(t, 0, 2, buf); mqtt.publish(TOPIC_ENV_TEMP, buf, true); // Temperature as string
+  dtostrf(h, 0, 2, buf); mqtt.publish(TOPIC_ENV_HUM,  buf, true); // Humidity as string
+  dtostrf(p, 0, 2, buf); mqtt.publish(TOPIC_ENV_PRES, buf, true); // Pressure as string
 
-  // Log the values to serial for human verification during testing.
-  Serial.printf("[ENV] T=%.2f°C  RH=%.2f%%  P=%.2f hPa\n", t, h, p);
+  Serial.printf("[ENV] T=%.2f°C  RH=%.2f%%  P=%.2f hPa\n", t, h, p); // Log values for serial debug
 }
 
-// Initializes the BME280 over SPI, verifies the sensor type, and sets oversampling/filtering.
-bool init_bme_spi() {
-  // Attempt to start the sensor; returns false if not found or not responding on these pins.
-  if (!bme.begin()) return false;  // SPI: begin() has no args
-  // Read the sensor ID register to distinguish BME280 (has humidity) from BMP280 (no humidity).
-  uint8_t id = bme.sensorID();     // 0x60 = BME280, 0x58 = BMP280
-  // Print which sensor we detected for transparency and to aid wiring/debugging.
+bool init_bme_spi() {                                   // Initialize BME280 over software SPI
+  if (!bme.begin()) return false;                       // Probe sensor; return false if not found
+  uint8_t id = bme.sensorID();                          // Read chip ID to distinguish BME/BMP
   Serial.printf("[BME] sensorID=0x%02X (%s)\n",
-                id, (id==0x60?"BME280":(id==0x58?"BMP280":"unknown")));
+                id, (id==0x60?"BME280":(id==0x58?"BMP280":"unknown"))); // Log detected device
 
-  // Configure measurement mode, oversampling, IIR filter, and standby time for stable readings.
-  bme.setSampling(
-    Adafruit_BME280::MODE_NORMAL,
-    Adafruit_BME280::SAMPLING_X2,     // temp
-    Adafruit_BME280::SAMPLING_X16,    // pressure
-    Adafruit_BME280::SAMPLING_X1,     // humidity (ignored on BMP)
-    Adafruit_BME280::FILTER_X16,
-    Adafruit_BME280::STANDBY_MS_500
+  bme.setSampling(                                     // Configure oversampling/filter/standby
+    Adafruit_BME280::MODE_NORMAL,                      // Continuous sampling mode
+    Adafruit_BME280::SAMPLING_X2,                      // Temperature oversampling x2
+    Adafruit_BME280::SAMPLING_X16,                     // Pressure oversampling x16
+    Adafruit_BME280::SAMPLING_X1,                      // Humidity oversampling x1 (BME only)
+    Adafruit_BME280::FILTER_X16,                       // IIR filter x16 for smoother values
+    Adafruit_BME280::STANDBY_MS_500                    // 500 ms standby between measurements
   );
-  // Signal to caller that initialization worked.
-  return true;
+  return true;                                         // Sensor initialized
 }
 
 // ---------- Arduino ----------
 
-// Arduino lifecycle hook; runs once at boot to set everything up.
-void setup() {
-  // Start the serial port so we can print logs at 115200 baud.
-  Serial.begin(115200);
-  // Small delay to let the USB serial terminal attach before we print the first lines.
-  delay(150);
-  // Intro banner so we know the firmware variant and sensor bus.
-  Serial.println("\n[BOOT] ESP32 + MQTT + BME280 (SPI) + KWS + AutoFan");
+void setup() {                                          
+  Serial.begin(115200);                                 // Initialize UART for logs at 115200 baud
+  delay(150);                                           // Small delay to let serial terminal attach
+  Serial.println("\n[BOOT] ESP32 + MQTT + BME280 (SPI) + KWS + AutoFan"); // Banner
 
-  // Make the LED pins outputs.
-  pinMode(LED_PIN, OUTPUT);        // built-in LED -> auto fan indicator
-  digitalWrite(LED_PIN, LOW);      // start “not listening”
-  pinMode(LED_LIGHT_PIN, OUTPUT);  // external LED for lights
-  digitalWrite(LED_LIGHT_PIN, LOW);
-  // Fan output
-  pinMode(FAN_PIN, OUTPUT);
-  digitalWrite(FAN_PIN, LOW);
-  fanOn = false;
+  pinMode(LED_PIN, OUTPUT);                             // Configure built-in LED as output
+  digitalWrite(LED_PIN, LOW);                           // Start with auto-fan indicator OFF
+  pinMode(LED_LIGHT_PIN, OUTPUT);                       // Configure external LED pin as output
+  digitalWrite(LED_LIGHT_PIN, LOW);                     // Start with lights OFF
+  pinMode(FAN_PIN, OUTPUT);                             // Configure fan driver pin as output
+  digitalWrite(FAN_PIN, LOW);                           // Ensure fan is OFF at boot
+  fanOn = false;                                        // Shadow state reset
+  lightOn = false;                                      // Shadow state reset for lights
 
-  // Initialize the logical light state so code/UI agree at startup.
-  lightOn = false;
+  ensureWiFi();                                         // Connect to Wi-Fi (blocking until connected)
+  mqtt.setCallback(onMsg);                              // Register MQTT message handler
+  ensureMqtt();                                         // Connect to MQTT and subscribe/publish LWT
 
-  // Join the Wi-Fi network (blocks until connected).
-  ensureWiFi();
-  // Assign the MQTT message callback handler so incoming messages get routed to onMsg.
-  mqtt.setCallback(onMsg);
-  // Establish/re-establish the MQTT session; subscribes and publishes LWT/online.
-  ensureMqtt();
-
-  // Try to bring up the BME/BMP over SPI; if it fails, we continue with just MQTT lights.
-  if (!init_bme_spi()) {
-    // Helpful wiring hint if sensor isn’t detected; prints once at boot.
-    Serial.println("[ERROR] BME/BMP not found over SPI. Check SCK=18, MISO=19, MOSI=23, CS=5, power & GND.");
-    // continue running so MQTT lights still work
+  if (!init_bme_spi()) {                                // Try to start BME/BMP
+    Serial.println("[ERROR] BME/BMP not found over SPI. Check SCK=18, MISO=19, MOSI=23, CS=5, power & GND."); // Wiring hint
   } else {
-    // Confirmation that environmental sensing is ready to go.
-    Serial.println("[BME] Initialized.");
+    Serial.println("[BME] Initialized.");               // Confirm sensor ready
   }
 
-  // Publish initial retained state so dashboards immediately pick up known values.
-  mqtt.publish(TOPIC_LIGHT_STATUS, "OFF", true);
-  // Mark device online after everything is initialized to reduce false “online” states.
-  mqtt.publish(TOPIC_ENV_STATUS, "online", true);
+  mqtt.publish(TOPIC_LIGHT_STATUS, "OFF", true);        // Publish initial lights state (retained)
+  mqtt.publish(TOPIC_ENV_STATUS, "online", true);       // Announce device online state (retained)
 
-  // ---- KWS bring-up ----
-  kws_prepare_dsp();
-  if (!kws_init_i2s()) {
-    Serial.println("[KWS] I2S init failed (check mic pins). Keyword spotting disabled.");
+  kws_prepare_dsp();                                    // Precompute DSP constants (Hamming/mel/DCT)
+  if (!kws_init_i2s()) {                                // Bring up the microphone interface
+    Serial.println("[KWS] I2S init failed (check mic pins). Keyword spotting disabled."); // Fail notice
   } else {
-    Serial.println("[KWS] Mic ready @16 kHz, MFCC online.");
+    Serial.println("[KWS] Mic ready @16 kHz, MFCC online."); // Success notice
   }
 }
 
-// Arduino main loop; runs repeatedly and should return quickly each iteration.
-void loop() {
-  // Keep Wi-Fi alive; reconnect if needed (handles AP drops).
-  ensureWiFi();
-  // Keep MQTT session alive; reconnect if needed (handles broker restarts).
-  ensureMqtt();
-  // Let PubSubClient process incoming/outgoing packets; must be called often.
-  mqtt.loop();
+void loop() {                                           
+  ensureWiFi();                                         // Maintain Wi-Fi (reconnect if needed)
+  ensureMqtt();                                         // Maintain MQTT (reconnect if needed)
+  mqtt.loop();                                          // Service MQTT client (process packets)
 
-  // Tracks time of last BME read to throttle sensor access independently of publish rate.
-  static unsigned long lastRead = 0;
-  // Snapshot current uptime in milliseconds for non-blocking timing.
-  const unsigned long now = millis();
+  static unsigned long lastRead = 0;                    // Last sensor read timestamp
+  const unsigned long now = millis();                   // Current time in ms
 
-  // Poll the sensor frequently (every 500 ms) so we have fresh data; we’ll rate-limit publishes later.
-  if (now - lastRead >= 500) { // read often (0.5s); publish throttled below
-    lastRead = now;
+  if (now - lastRead >= 500) {                          // Read sensor every 500 ms
+    lastRead = now;                                     // Update schedule
 
-    // Read temperature in Celsius from the BME/BMP; may be NaN if sensor missing.
-    float t = bme.readTemperature();
-    // Read relative humidity; will be NaN on BMP280 (it has no humidity sensor).
-    float h = bme.readHumidity();             // NaN on BMP280
-    // Read pressure in Pascals and convert to hPa (divide by 100.0f).
-    float p = bme.readPressure() / 100.0f;    // hPa
+    float t = bme.readTemperature();                    // Read temperature (°C)
+    float h = bme.readHumidity();                       // Read humidity (%RH) (NaN on BMP280)
+    float p = bme.readPressure() / 100.0f;              // Read pressure (Pa) → convert to hPa
 
-    // Save for auto fan control.
-    if (!isnan(t)) current_temp_c = t;
+    if (!isnan(t)) current_temp_c = t;                  // Cache temperature for fan control
 
-    // If at least one value is a number, proceed (protects against all-NaN cases).
-    if (!isnan(t) || !isnan(h) || !isnan(p)) {
-      bool changed = false;
-      if (isnan(last_t) || (!isnan(t) && fabsf(t - last_t) > MIN_DELTA_TEMP)) changed = true;
-      if (isnan(last_h) || (!isnan(h) && fabsf(h - last_h) > MIN_DELTA_HUM))  changed = true;
-      if (isnan(last_p) || (!isnan(p) && fabsf(p - last_p) > MIN_DELTA_PRES)) changed = true;
+    if (!isnan(t) || !isnan(h) || !isnan(p)) {          // Only proceed if at least one value valid
+      bool changed = false;                             // Flag if any delta exceeds epsilon
+      if (isnan(last_t) || (!isnan(t) && fabsf(t - last_t) > MIN_DELTA_TEMP)) changed = true; // Temp delta
+      if (isnan(last_h) || (!isnan(h) && fabsf(h - last_h) > MIN_DELTA_HUM))  changed = true; // Hum delta
+      if (isnan(last_p) || (!isnan(p) && fabsf(p - last_p) > MIN_DELTA_PRES)) changed = true; // Press delta
 
-      if (changed || (now - t_last_pub) >= PUBLISH_MS) {
-        publish_env(t, h, p);
-        last_t = t; last_h = h; last_p = p;
-        t_last_pub = now;
+      if (changed || (now - t_last_pub) >= PUBLISH_MS) { // Publish if changed enough or time elapsed
+        publish_env(t, h, p);                           // Publish snapshot + scalars (retained)
+        last_t = t; last_h = h; last_p = p;             // Update last values
+        t_last_pub = now;                               // Reset rate limiter
       }
     }
 
-    // Apply fan control after we have a fresh temp (or keep using last temp).
-    controlFanByTemp();
+    controlFanByTemp();                                 // Apply thermostat logic (auto mode only)
   }
 
-  // Tiny delay to yield CPU time to Wi-Fi/MQTT stacks and avoid a 100% busy loop.
-  delay(10);
-
-  // ---- KWS processing ----
-  kws_process_audio();
+  delay(10);                                            // Yield CPU to Wi-Fi/MQTT stacks
+  kws_process_audio();                                  // Pump audio → MFCC → KWS state machine
 }
