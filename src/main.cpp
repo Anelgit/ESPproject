@@ -81,11 +81,19 @@ static const char* TOPIC_ENV_TEMP   = "ahodza/home/env/temp_c";       // Retaine
 static const char* TOPIC_ENV_HUM    = "ahodza/home/env/humidity";     // Retained numeric humidity
 static const char* TOPIC_ENV_PRES   = "ahodza/home/env/pressure_hpa"; // Retained numeric pressure
 
+// Fan topics for Node-RED 
+static const char* TOPIC_FAN_SET     = "cooling/set";     // accepts: ON/OFF or AUTO/SLEEP
+static const char* TOPIC_FAN_STATUS  = "cooling/status";  // publishes: ON/OFF (retained)
+
 // ---------- Hardware ----------
 
 constexpr int LED_PIN = 2;              // Built-in LED (GPIO2) used as "auto fan enabled" indicator
 constexpr int LED_LIGHT_PIN = 4;        // External LED output for "lights on/off" indication (GPIO4)
 constexpr int FAN_PIN = 27;             // Fan driver output pin (to MOSFET/relay input), HIGH = fan ON
+
+#ifndef FAN_ACTIVE_HIGH
+#define FAN_ACTIVE_HIGH 1   // 1 = HIGH means ON (default). 0 = LOW means ON.
+#endif
 
 // BME280 SPI pins (software SPI wiring for Adafruit_BME280)
 #define BME_SCK   18                    // SPI clock pin wired to BME SCK
@@ -117,17 +125,35 @@ float last_t = NAN, last_h = NAN, last_p = NAN; // Last published readings (NaN 
 const float FAN_TARGET_C = 20.0f;       // Desired room temperature setpoint (°C)
 const float FAN_HYST_C   = 1.0f;        // Total hysteresis band (°C) to prevent fan chatter
 
+static uint32_t manualOverrideUntil = 0;  // ms timestamp; >0 means 'ignore auto' until then
+
 bool  autoFanEnabled = false;           // Flag: true when listening to temp sensor (auto mode)
 bool  fanOn = false;                    // Fan output shadow state (HIGH when true)
 float current_temp_c = NAN;             // Latest temperature sample for control logic
+
+
+static inline void publishFanStatus() {
+  mqtt.publish(TOPIC_FAN_STATUS, fanOn ? "ON" : "OFF", true);
+}
+
+static inline void setFanOutput(bool on) {
+  if (fanOn == on) return;
+
+  int level_on  = FAN_ACTIVE_HIGH ? HIGH : LOW;
+  int level_off = FAN_ACTIVE_HIGH ? LOW  : HIGH;
+
+  digitalWrite(FAN_PIN, on ? level_on : level_off);
+  fanOn = on;
+  publishFanStatus();
+  Serial.printf("[FAN] %s\n", on ? "ON" : "OFF");
+}
 
 void setAutoFan(bool enabled) {         // Enable/disable auto fan mode and update indicator/fan
   autoFanEnabled = enabled;             // Remember desired auto mode
   digitalWrite(LED_PIN, enabled ? HIGH : LOW); // Built-in LED shows auto fan listening state
   if (!enabled) {                       // If disabling auto mode ("sleep")
     if (fanOn) {                        // And fan currently on, force it off
-      digitalWrite(FAN_PIN, LOW);       // Drive output LOW to stop fan (assumes active-HIGH)
-      fanOn = false;                    // Update shadow state
+      setFanOutput(false);
       Serial.println("[FAN] OFF (sleep)"); // Log action for debugging
     }
   } else {
@@ -137,23 +163,33 @@ void setAutoFan(bool enabled) {         // Enable/disable auto fan mode and upda
 
 void controlFanByTemp() {               // Apply simple thermostat control using hysteresis
   if (!autoFanEnabled || isnan(current_temp_c)) return; // Exit if not in auto or temp invalid
+
+  if (manualOverrideUntil && millis() < manualOverrideUntil) return; // Still in manual override period
+
   const float hi = FAN_TARGET_C + (FAN_HYST_C * 0.5f);  // Upper threshold to turn ON
   const float lo = FAN_TARGET_C - (FAN_HYST_C * 0.5f);  // Lower threshold to turn OFF
 
   if (!fanOn && current_temp_c > hi) {  // If fan is off and temp exceeded high
-    digitalWrite(FAN_PIN, HIGH);        // Turn fan ON (energize output)
-    fanOn = true;                       // Update shadow state
+    setFanOutput(true);
     Serial.printf("[FAN] ON (T=%.2f > %.2f)\n", current_temp_c, hi); // Log with numbers
   } else if (fanOn && current_temp_c < lo) { // If fan is on and temp dropped below low
-    digitalWrite(FAN_PIN, LOW);         // Turn fan OFF
-    fanOn = false;                      // Update shadow state
+    setFanOutput(false);
     Serial.printf("[FAN] OFF (T=%.2f < %.2f)\n", current_temp_c, lo); // Log with numbers
   }
 }
 
-void applyLight(bool on);               // Forward declaration so KWS logic can call before defined
-void ensureWiFi();                      // Forward declaration for Wi-Fi helper
-void ensureMqtt();                      // Forward declaration for MQTT helper
+/* ---------- Forward declarations (prototypes) ---------- */
+void publishFanStatus();
+void setFanOutput(bool on);
+void setAutoFan(bool enabled);
+void controlFanByTemp();
+void applyLight(bool on);
+void ensureWiFi();
+void ensureMqtt();
+void onMsg(char* topic, byte* payload, unsigned int len);
+void kws_prepare_dsp();
+bool kws_init_i2s();
+void kws_process_audio();
 
 // ---------- Audio / KWS ----------
 //
@@ -555,6 +591,35 @@ void onMsg(char* topic, byte* payload, unsigned int len) { // MQTT callback for 
     } else {
       Serial.printf("[WARN] Unknown payload on lights/set: '%s'\n", buf); // Warn on unknown command
     }
+
+  }
+  else if (strcmp(topic, TOPIC_FAN_SET) == 0) {
+    for (size_t i=0;i<n;++i) buf[i] = (char)toupper((unsigned char)buf[i]);
+    if (!strcmp(buf,"ON")) {
+      autoFanEnabled = false;
+      digitalWrite(LED_PIN, LOW);
+      setFanOutput(true);
+      manualOverrideUntil = millis() + 5000;   // 5 s where auto logic is ignored
+      Serial.println("[FAN] MANUAL ON (MQTT cooling/set)");
+    } else if (!strcmp(buf,"OFF")) {
+      // OFF
+      autoFanEnabled = false;
+      digitalWrite(LED_PIN, LOW);
+      setFanOutput(false);
+      manualOverrideUntil = millis() + 5000;   // 5 s where auto logic is ignored
+      Serial.println("[FAN] MANUAL OFF (MQTT cooling/set)");
+
+    } else if (!strcmp(buf,"AUTO")) {
+      setAutoFan(true);
+      manualOverrideUntil = 0;
+      publishFanStatus();
+    } else if (!strcmp(buf,"SLEEP")) {
+      setAutoFan(false);
+      manualOverrideUntil = 0;
+      publishFanStatus();
+    } else {
+      Serial.printf("[WARN] Unknown payload on cooling/set: '%s'\n", buf);
+    }
   }
 }
 
@@ -618,9 +683,12 @@ void ensureMqtt() {                                     // Connect/reconnect to 
 
   Serial.println("OK");                                 // Connected to broker
   mqtt.subscribe(TOPIC_LIGHT_SET);                      // Subscribe to lights control topic
+  mqtt.subscribe(TOPIC_FAN_SET);                        // Subscribe to fan control topic  
   mqtt.publish(TOPIC_LIGHT_STATUS, lightOn ? "ON" : "OFF", true); // Publish initial lights state (retained)
   mqtt.publish(TOPIC_ENV_STATUS, "online", true);       // Set status retained to "online"
+  publishFanStatus();                                   // publish current fan state
 }
+
 
 void publish_env(float t, float h, float p) {           // Publish JSON snapshot and scalar topics
   char json[160];                                       // Temp buffer for JSON string
@@ -666,7 +734,7 @@ void setup() {
   pinMode(LED_LIGHT_PIN, OUTPUT);                       // Configure external LED pin as output
   digitalWrite(LED_LIGHT_PIN, LOW);                     // Start with lights OFF
   pinMode(FAN_PIN, OUTPUT);                             // Configure fan driver pin as output
-  digitalWrite(FAN_PIN, LOW);                           // Ensure fan is OFF at boot
+  setFanOutput(false);                                  // Start with fan OFF
   fanOn = false;                                        // Shadow state reset
   lightOn = false;                                      // Shadow state reset for lights
 
@@ -682,6 +750,8 @@ void setup() {
 
   mqtt.publish(TOPIC_LIGHT_STATUS, "OFF", true);        // Publish initial lights state (retained)
   mqtt.publish(TOPIC_ENV_STATUS, "online", true);       // Announce device online state (retained)
+
+  publishFanStatus();                                   // make sure dashboard has the last fan state
 
   kws_prepare_dsp();                                    // Precompute DSP constants (Hamming/mel/DCT)
   if (!kws_init_i2s()) {                                // Bring up the microphone interface
