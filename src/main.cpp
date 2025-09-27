@@ -182,11 +182,11 @@ void kws_process_audio();
 
 // ---------- Audio / KWS ----------
 //
-// Lightweight I²S mic + MFCC + template matching (approximate).         // Overview of audio pipeline
-// - Uses arduinoFFT to compute spectra                                  // FFT basis
-// - 16 kHz mono, 25 ms window, 10 ms hop                                // Framing parameters
-// - 26 mel filters → 13 MFCCs (matches KWS_N_MFCC from wakeword_templates.h) // Feature dimensions
-// - Classes: 0 = wake, 1 = "lights on", 2 = "lights off"                // Class mapping
+// Lightweight I²S mic + MFCC + template matching (approximate).         
+// - Uses arduinoFFT to compute spectra                                
+// - 16 kHz mono, 25 ms window, 10 ms hop                                
+// - 26 mel filters → 13 MFCCs (matches KWS_N_MFCC from wakeword_templates.h) 
+// - Classes: 0 = wake, 1 = "lights on", 2 = "lights off"                
 //
 #ifndef I2S_BCLK_PIN
 #define I2S_BCLK_PIN 26                 // I²S bit-clock (SCK/BCLK) pin to mic breakout
