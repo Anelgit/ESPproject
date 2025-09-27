@@ -23,26 +23,15 @@
  * Hardware:                                                             
  *   - ESP32 DevKit                                                      
  *   - Onboard LED (GPIO 2) or external LED/fan on GPIO 14               
- *   - BME sensor for temperature & humidity                   
+ *   - BME sensor for temperature & humidity    
+ *   - I2S MEMS microphone for KWS (GPIOs 26,25,33)               
  *
  * Software Stack:                                                       
  *   - Arduino Core for ESP32                                            
  *   - PubSubClient (MQTT)                                               
  *   - Node-RED Dashboard                                                
  *   - Mosquitto Broker (local)                                          
- *
- * TODO (updated):                                                       
- *   [ ] Persist settings in NVS (Preferences): autoFanEnabled & FAN_TARGET_C      
- *   [ ] Add MQTT config topics:                                           
- *       - ahodza/home/fan/target_c/set (Number)                           
- *       - ahodza/home/fan/mode/set ("auto"/"sleep")                       
- *   [ ] Node-RED: add fan tile (mode/target/status) + charts for T/RH/P    
- *   [ ] Hardware: drive fan via MOSFET or relay + flyback, add series resistor on LEDs 
- *   [ ] Security: optional MQTT auth/TLS; move creds to secrets header               
- *   [ ] KWS: capture more templates (esp. wake), optional distinct "off" phrase      
- *   [ ] KWS: disable debug in prod, add lightweight telemetry event (optional)       
- *   [ ] Networking: exponential backoff and error LED pattern on Wi-Fi/MQTT failure  
- *   [ ] Power: consider light sleep when idle, tune VAD thresholds to lower CPU      
+ *    
  *
  *******************************************************/
 #include <Arduino.h>                     
